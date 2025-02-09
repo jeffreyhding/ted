@@ -1,0 +1,206 @@
+---
+title: "TED Contract Award Notices"
+author: "Jeffrey Ding"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(plotly)
+```
+
+```{r}
+ted_data <- read.csv("export_CAN_2023_2018.csv")
+```
+
+```{r}
+# 2-digit CPV division codes and corresponding CPV division names
+cpv_divisions <- read.csv("cpv_divisions.csv") |>
+  mutate(DIVISION_CODE = str_sub(DIVISION_CODE, 2, 3))
+```
+
+```{r}
+clean_data <- ted_data |>
+  select(
+    # CAN identifying data
+    ID_NOTICE_CAN,  # unique identifier for CAN
+    ID_LOT,  # lot identifier
+    LOTS_NUMBER,  # number of lots for a given CAN
+    B_MULTIPLE_CAE,  # Multiple contracting authorities/entities (Y/N)
+    CAE_NAME,  # name of CAE
+    CAE_TYPE,  # type of CAE
+    ISO_COUNTRY_CODE,  # country of first listed CAE
+    
+    # CAN information
+    CPV,  # Common Procurement Vocabulary code of main object of contract
+    MAIN_CPV_CODE_GPA,  # CPV code shortened to 2-5 digits, manually cleaned for WTO Government Procurement Agreement reporting
+    ADDITIONAL_CPVS,  # CPV code of additional object(s) of contract
+    CANCELLED,  # 1 = notice was later cancelled
+    B_INVOLVES_JOINT_PROCUREMENT,  # contract involves joint procurement (Y/N)
+    TYPE_OF_CONTRACT,  # type of contract (W = "Works", U = "Supplies", S = "Services)
+    MAIN_ACTIVITY,  # function of government expenditure
+    VALUE_EURO,  # CAN value in Euros
+    VALUE_EURO_FIN_2,  # CAN value in Euros; if available, overwritten by human-made estimates of values for large value contracts which seemed to be incorrect
+    B_EU_FUNDS,  # contract related to project/program financed by EU funds
+    
+    # CA data
+    NUMBER_AWARDS,  # number of contract awards for a given CAN
+    ID_AWARD,  # unique contract award identifier for CAN
+    ID_LOT_AWARDED,  # lot identifier within award
+    B_AWARDED_TO_A_GROUP,  # contract awarded to a group of economic operators (Y/N)
+    WIN_NAME,  # name of awarded operator
+    WIN_COUNTRY_CODE,  # country code of awarded operator,
+    TITLE,  # title of procurement
+    AWARD_VALUE_EURO,  # contract award value in Euros
+    AWARD_VALUE_EURO_FIN_1,  # contract award value in Euros, fills in missing values
+    
+    # CA selection information
+    TOP_TYPE,  # type of selection procedure
+    CRIT_CODE,  # award criteria (L = lowest price, M = most economically advantageous tender)
+    B_ELECTRONIC_AUCTION  # electronic auction used (Y/N)
+  ) |>
+  mutate(TYPE_OF_CONTRACT = recode(TYPE_OF_CONTRACT,
+                                   "W" = "Works", 
+                                   "U" = "Supplies", 
+                                   "S" = "Services"))
+```
+
+
+```{r}
+# Remove cancelled contracts [see Notes & Codebook 3.9]
+clean_data <- clean_data |>
+  filter(CANCELLED != 1)
+```
+
+```{r}
+# Remove duplicates at the contract award level [see Notes & Codebook 3.6]
+clean_data <- clean_data |>
+  distinct(ID_AWARD, .keep_all=TRUE)
+```
+
+```{r}
+# Replaces VALUE_EURO with VALUE_EURO_FIN_2 ("human-made estimates of values for large value contracts which seemed to be incorrect") if possible [see Notes & Codebook 4]
+clean_data <- clean_data |>
+  mutate(VALUE_EURO = coalesce(VALUE_EURO_FIN_2, VALUE_EURO)) |>
+  select(-VALUE_EURO_FIN_2)
+```
+
+```{r}
+# Merges CAN data with corresponding CPV division names (first 2 digits of CPV correspond to the broadest category for describing the subject of the contract)
+clean_data <- clean_data |>
+  mutate(CPV_DIVISION = substr(CPV, 1, 2)) |>
+  left_join(cpv_divisions, by = c("CPV_DIVISION" = "DIVISION_CODE")) |>
+  relocate(CPV_DIVISION, .after = MAIN_CPV_CODE_GPA) |>
+  relocate(DIVISION_NAME, .after = CPV_DIVISION)
+```
+
+```{r}
+clean_data
+```
+
+```{r}
+# create a new dataframe instead of modifying clean_data
+classified_data <- clean_data
+
+# Method 1: classify CPVs based on mean CPV frequency
+# count occurrences of each CPV code
+cpv_counts <- classified_data |>
+  count(CPV, name = "CPV_FREQUENCY")
+
+# merge CPV frequency into data
+classified_data <- classified_data |>
+  left_join(cpv_counts, by = "CPV")
+
+# define CPV threshold for "Unsual" contracts (below the average CANS per CPV)
+# 1660093 unique CAs and 7849 unique CPVs
+cpv_threshold <- length(unique(clean_data$ID_NOTICE_CAN)) / length(unique(clean_data$CPV))
+
+# classify CPVs based on threshold
+classified_data <- classified_data |>
+  mutate(CPV_CLASSIFICATION = ifelse(CPV_FREQUENCY < cpv_threshold, "Unusual", "Usual"))
+
+
+# Method 2: classify CPVs based on frequency within own CPV division
+# calculate CPV proportion within each CPV Division
+cpv_division_counts <- classified_data |>
+  group_by(CPV_DIVISION, CPV) |>
+  summarise(CPV_DIVISION_PROPORTION = n() / sum(n()), .groups = "drop")
+
+# merge the CPV division proportions back into data
+classified_data <- classified_data |>
+  left_join(cpv_division_counts, by = c("CPV_DIVISION", "CPV"))
+
+# define CPV proportion threshold within by 10th percentile frequency in each division
+division_thresholds <- cpv_division_counts |>
+  group_by(CPV_DIVISION) |>
+  summarise(DIVISION_THRESHOLD = quantile(CPV_DIVISION_PROPORTION, 0.1, na.rm = TRUE), .groups = "drop")
+
+# merge computed thresholds back into data (so thresholds are dynamic for CPV divisions)
+classified_data <- classified_data |>
+  left_join(division_thresholds, by = "CPV_DIVISION")
+
+# classify CPVs based on proportion threshold
+classified_data <- classified_data |>
+  mutate(CPV_DIVISION_CLASSIFICATION = ifelse(CPV_DIVISION_PROPORTION < DIVISION_THRESHOLD, "Unusual", "Usual"))
+
+
+# final classification: if either method considers contract "Unusual"
+classified_data <- classified_data |>
+  mutate(FINAL_CLASSIFICATION = ifelse(
+    CPV_CLASSIFICATION == "Unusual" | CPV_DIVISION_CLASSIFICATION == "Unusual",
+    "Unusual",
+    "Usual"
+  ))
+
+# summary tables
+contract_summary <- classified_data |>
+  count(FINAL_CLASSIFICATION) |>
+  mutate(percentage = n / sum(n) * 100)
+
+top_cpv_divisions <- classified_data |>
+  count(CPV_DIVISION, FINAL_CLASSIFICATION, name = "Contract_Count") |>
+  pivot_wider(names_from = FINAL_CLASSIFICATION, values_from = Contract_Count, values_fill = list(Contract_Count = 0)) |>
+  left_join(select(cpv_divisions, CPV_DIVISION = DIVISION_CODE, DIVISION_NAME), by = "CPV_DIVISION") |>
+  mutate(Total_Contracts = Usual + Unusual,
+         Unusual_Percentage = (Unusual / Total_Contracts) * 100) |>
+  relocate(DIVISION_NAME, .after = CPV_DIVISION) |> 
+  relocate(Total_Contracts, .after = DIVISION_NAME) |>
+  arrange(desc(Total_Contracts))
+
+print(contract_summary)
+print(top_cpv_divisions)
+```
+
+
+
+```{r}
+# Summarize CPV division counts with classification
+cpv_division_summary <- classified_data |>
+  count(CPV_DIVISION, DIVISION_NAME, FINAL_CLASSIFICATION, name = "Count") |>
+  arrange(desc(Count))
+
+# Stacked bar chart of CPV divisions filled by "usual"/"unusual" contracts
+plot <- ggplot(cpv_division_summary, aes(x = reorder(CPV_DIVISION, -Count), y = Count, 
+                                         fill = FINAL_CLASSIFICATION, 
+                                         text = paste0("CPV: ", CPV_DIVISION,
+                                                       "<br>Division: ", DIVISION_NAME,
+                                                       "<br>Classification: ", FINAL_CLASSIFICATION,
+                                                       "<br>Count: ", Count))) +
+  geom_bar(stat = "identity", position = "stack") + 
+  scale_fill_manual(values = c("Usual" = "steelblue", "Unusual" = "red")) +
+  scale_y_continuous(breaks = seq(0, 2000000, 250000)) +
+  theme_minimal() +
+  labs(title = "Distribution of CPV Divisions (Usual vs. Unusual)",
+       x = "CPV Division",
+       y = "Number of Contracts",
+       fill = "Contract Type") +
+  theme(plot.background = element_rect(fill="seashell2"),
+        panel.background = element_rect(fill="seashell"),
+        panel.grid.major = element_line(color="grey70"),
+        axis.line = element_line(color="black"),
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Convert ggplot to Plotly and enable hover tooltips
+ggplotly(plot, tooltip = "text")
+```
+
